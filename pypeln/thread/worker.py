@@ -8,6 +8,7 @@ import stopit
 from pypeln import utils as pypeln_utils
 
 from . import utils
+from .order import OrderTracker
 from .queue import IterableQueue, OutputQueues
 
 WorkerConstructor = tp.Callable[[int, "StageParams", IterableQueue], "Worker"]
@@ -24,15 +25,21 @@ class StageParams(tp.NamedTuple):
     input_queue: IterableQueue
     output_queues: OutputQueues
     namespace: utils.Namespace
+    tracker: tp.Optional[OrderTracker] = None
 
     @classmethod
     def create(
-        cls, input_queue: IterableQueue, output_queues: OutputQueues, total_workers: int
+        cls,
+        input_queue: IterableQueue,
+        output_queues: OutputQueues,
+        total_workers: int,
+        tracker: tp.Optional[OrderTracker] = None,
     ) -> "StageParams":
         return cls(
             namespace=utils.Namespace(active_workers=total_workers),
             input_queue=input_queue,
             output_queues=output_queues,
+            tracker=tracker,
         )
 
     def worker_done(self):
@@ -92,6 +99,12 @@ class Worker(tp.Generic[T]):
                 **{key: value for key, value in kwargs.items() if key in self.f_args},
             )
 
+            if self.stage_params.input_queue.namespace.force_stop:
+                # the pipeline is being shut down (early close): mirror the
+                # lifecycle of a stopped worker and skip the completion
+                # epilogue instead of reporting normal termination.
+                raise pypeln_utils.StopThreadException
+
             self.stage_params.worker_done()
 
             if self.on_done is not None:
@@ -132,6 +145,19 @@ class Worker(tp.Generic[T]):
 
         self.namespace.task_start_time = None
 
+        # if the worker is being stopped (timeout or early close) while
+        # processing an element of an order-preserving pipeline, abandon the
+        # element so the stage's watermark can advance past it: the already
+        # emitted prefix is kept, the remaining output is skipped, and any
+        # late element produced by the old worker is discarded downstream so
+        # it cannot affect the new round. The element is keyed by the
+        # worker's current thread so a surviving old thread can never
+        # interfere with the new round.
+        tracker = self.stage_params.tracker
+
+        if tracker is not None and self.process.ident is not None:
+            tracker.abandon(self.process.ident)
+
         if not self.process.is_alive():
             return
 
@@ -171,10 +197,24 @@ class Applicable(pypeln_utils.Protocol):
 
 
 class ApplyProcess(ProcessFn, Applicable):
+    # stages built on `ApplyProcess` (map, filter, flat_map, each) preserve
+    # the index of their input elements, so they can take part in an
+    # order-preserving pipeline when a downstream stage requests it.
+    supports_ordered_mode = True
+
     def __call__(self, worker: Worker, **kwargs):
+        tracker = worker.stage_params.tracker
+
         for elem in worker.stage_params.input_queue:
-            with worker.measure_task_time():
-                self.apply(worker, elem, **kwargs)
+            try:
+                with worker.measure_task_time():
+                    self.apply(worker, elem, **kwargs)
+            finally:
+                if tracker is not None:
+                    # notify the tracker even if the element produced no
+                    # output (or the worker is being stopped) so the stage's
+                    # watermark can advance past it.
+                    tracker.finish(threading.get_ident())
 
 
 class StageStatus:

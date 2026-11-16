@@ -12,6 +12,11 @@ from .to_stage import to_stage
 
 @dataclass
 class Concat(ApplyProcess):
+    # concat merges several sources whose indexes overlap, so it cannot take
+    # part in an order-preserving pipeline: it neither propagates watermark
+    # requests upstream nor emits watermarks downstream.
+    supports_ordered_mode = False
+
     def apply(self, worker: Worker, elem: tp.Any, **kwargs):
         worker.stage_params.output_queues.put(elem)
 

@@ -1,4 +1,5 @@
 import sys
+import threading
 import traceback
 import typing as tp
 from queue import Empty, Full, Queue
@@ -6,6 +7,10 @@ from queue import Empty, Full, Queue
 from pypeln import utils as pypeln_utils
 
 from . import utils
+from .order import Watermark
+
+if tp.TYPE_CHECKING:
+    from .order import OrderTracker
 
 T = tp.TypeVar("T")
 
@@ -21,6 +26,15 @@ class IterableQueue(Queue, tp.Generic[T], tp.Iterable[T]):
             remaining=total_sources, exception=False, force_stop=False
         )
         self.exception_queue: "Queue[PipelineException]" = Queue()
+
+        # When `ordered_mode` is set the producer of this queue interleaves
+        # `Watermark` items between the elements so the consumer can emit
+        # results in order without buffering the whole stream.
+        self.ordered_mode = False
+        # When a tracker is set, `get` registers the dequeued elements as in
+        # flight and consumes `Watermark` items transparently, so the workers
+        # of the stage only ever see real elements.
+        self.tracker: tp.Optional["OrderTracker"] = None
 
     def get(self, block: bool = True, timeout: tp.Optional[float] = None) -> T:
         while True:
@@ -54,6 +68,16 @@ class IterableQueue(Queue, tp.Generic[T], tp.Iterable[T]):
 
                 continue
 
+            tracker = self.tracker
+
+            if tracker is not None:
+                if isinstance(x, Watermark):
+                    tracker.receive(x.index)
+
+                    continue
+
+                tracker.start(threading.get_ident(), x.index)
+
             return x
 
     # put is implemented like this for thread but not for process
@@ -72,9 +96,14 @@ class IterableQueue(Queue, tp.Generic[T], tp.Iterable[T]):
             return super().put(x, block=False, timeout=timeout)
 
     def clear(self):
+        # NOTE: this deliberately bypasses the overriden `get` (which
+        # `Queue.get_nowait` would dispatch to): `get` gives priority to a
+        # pending exception, and if the exception was already consumed it
+        # would block forever waiting for one that never arrives. Clearing
+        # only needs to discard the queued items.
         try:
             while True:
-                self.get_nowait()
+                Queue.get(self, block=False)
         except Empty:
             pass
 
@@ -132,6 +161,13 @@ class OutputQueues(tp.List[IterableQueue[T]], tp.Generic[T]):
     def put(self, x: T):
         for queue in self:
             queue.put(x)
+
+    def put_watermark(self, x: Watermark):
+        # watermarks are only sent to the queues whose consumer requested
+        # them through `ordered_mode`, all other consumers are unaffected.
+        for queue in self:
+            if getattr(queue, "ordered_mode", False):
+                queue.put(x)
 
     def worker_done(self):
         for queue in self:

@@ -11,18 +11,35 @@ class FromIterable(tp.NamedTuple):
     iterable: tp.Iterable
     maxsize: int
 
+    # the source assigns indexes in increasing order, so it can report its
+    # progress downstream through watermarks.
+    supports_ordered_mode = True
+
     def __call__(self, worker: Worker, **kwargs):
+        tracker = worker.stage_params.tracker
+
         if isinstance(self.iterable, pypeln_utils.BaseStage):
+            # the elements arrive in completion order, so no ordering
+            # guarantees can be given and no watermarks are emitted.
             for x in self.iterable.to_iterable(maxsize=self.maxsize, return_index=True):
                 worker.stage_params.output_queues.put(x)
         else:
+            emit_watermarks = tracker is not None
+
             for i, x in enumerate(self.iterable):
                 if isinstance(x, pypeln_utils.Element):
+                    # elements that already carry an index may arrive in any
+                    # order, so no watermark can be safely emitted.
+                    emit_watermarks = False
                     worker.stage_params.output_queues.put(x)
                 else:
                     worker.stage_params.output_queues.put(
                         pypeln_utils.Element(index=(i,), value=x)
                     )
+
+                    if emit_watermarks:
+                        # every element put from now on has an index >= (i+1,)
+                        tracker.receive((i + 1,))
 
 
 @tp.overload
